@@ -1,14 +1,15 @@
 """
-Finance Tracking Telegram Bot — Step 2
-Adds Notion schema validation, account/category cache, fuzzy name
-resolution, and /accounts command. Other messages still echo.
+Finance Tracking Telegram Bot — Step 3
+Adds /e, /i, /t commands with full receipts and error messages.
 """
 
+import html
 import json
 import os
 import sys
 import traceback
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional
 
 import requests
@@ -19,9 +20,9 @@ from rapidfuzz import fuzz, process as fuzz_process
 # Config
 # ---------------------------------------------------------------------------
 
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-NOTION_KEY       = os.environ["NOTION_API_KEY"]
-ALLOWED_USER_ID  = int(os.environ["ALLOWED_TELEGRAM_USER_ID"])
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
+NOTION_KEY        = os.environ["NOTION_API_KEY"]
+ALLOWED_USER_ID   = int(os.environ["ALLOWED_TELEGRAM_USER_ID"])
 BOT_STATE_PAGE_ID = os.environ["BOT_STATE_PAGE_ID"]
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -38,18 +39,16 @@ DB_INCOME     = "23efa9ca-b092-8135-af20-000be6ea046b"
 DB_TRANSFER   = "23efa9ca-b092-811c-927f-000b84373de0"
 DB_CATEGORIES = "23efa9ca-b092-8196-a31f-000bc455781d"
 
-# Required property names per database (checked at startup)
 REQUIRED_PROPS: dict[str, set[str]] = {
     "Accounts":   {"Name", "Initial Amount", "Currency"},
     "Expenses":   {"Expense", "Total Amount", "Date", "Accounts", "Categories", "Notes"},
     "Transfer":   {"Name", "Date", "Amount Out", "Amount In", "From Account", "To Account"},
     "Categories": {"Name", "Monthly Budget"},
-    # Income: title + amount discovered dynamically; only these are hard-required:
     "Income":     {"Date", "Accounts"},
 }
 
 # ---------------------------------------------------------------------------
-# Account alias shortcuts  (case-insensitive keys)
+# Account alias shortcuts
 # ---------------------------------------------------------------------------
 
 ACCOUNT_ALIASES: dict[str, str] = {
@@ -76,10 +75,7 @@ ACCOUNT_ALIASES: dict[str, str] = {
 }
 
 CURRENCY_FLAG: dict[str, str] = {
-    "EGP": "🇪🇬",
-    "USD": "🇺🇸",
-    "EUR": "🇪🇺",
-    "GBP": "🇬🇧",
+    "EGP": "🇪🇬", "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧",
 }
 
 # ---------------------------------------------------------------------------
@@ -91,7 +87,7 @@ CURRENCY_FLAG: dict[str, str] = {
 class Account:
     page_id: str
     name: str
-    currency: str  # EGP | USD | EUR | GBP
+    currency: str
 
 
 @dataclass
@@ -103,14 +99,13 @@ class Category:
 
 @dataclass
 class IncomeSchema:
-    """Dynamically discovered Income DB property names."""
     title_prop: str
     amount_prop: str
     notes_prop: Optional[str]
 
 
 # ---------------------------------------------------------------------------
-# Global cache — populated once per run during startup
+# Global cache
 # ---------------------------------------------------------------------------
 
 ACCOUNTS: list[Account] = []
@@ -123,7 +118,6 @@ INCOME_SCHEMA: Optional[IncomeSchema] = None
 
 
 def notion_query_all(database_id: str, **kwargs) -> list[dict]:
-    """Query a Notion DB and return ALL pages, handling pagination."""
     results: list[dict] = []
     cursor: Optional[str] = None
     while True:
@@ -138,18 +132,12 @@ def notion_query_all(database_id: str, **kwargs) -> list[dict]:
     return results
 
 
-def _title_text(prop_value: dict) -> str:
-    parts = prop_value.get("title") or prop_value.get("rich_text") or []
-    return parts[0]["plain_text"] if parts else ""
-
-
 # ---------------------------------------------------------------------------
 # Startup: schema validation + cache loading
 # ---------------------------------------------------------------------------
 
 
 def validate_and_load_schemas() -> None:
-    """Fetch all DB schemas, validate required properties, fill global caches."""
     global ACCOUNTS, CATEGORIES, INCOME_SCHEMA
 
     db_map = {
@@ -161,73 +149,53 @@ def validate_and_load_schemas() -> None:
     }
 
     print("Fetching Notion schemas…")
-    schemas: dict[str, dict] = {
-        label: notion.databases.retrieve(database_id=db_id)
-        for label, db_id in db_map.items()
-    }
+    schemas = {label: notion.databases.retrieve(database_id=db_id)
+               for label, db_id in db_map.items()}
 
-    # Validate required property names
     errors: list[str] = []
-    for label, required_names in REQUIRED_PROPS.items():
-        actual_names = set(schemas[label]["properties"].keys())
-        missing = required_names - actual_names
+    for label, required in REQUIRED_PROPS.items():
+        missing = required - set(schemas[label]["properties"].keys())
         if missing:
-            errors.append(f"  [{label}] missing properties: {sorted(missing)}")
+            errors.append(f"  [{label}] missing: {sorted(missing)}")
     if errors:
-        raise RuntimeError("Notion schema validation failed:\n" + "\n".join(errors))
+        raise RuntimeError("Schema validation failed:\n" + "\n".join(errors))
 
-    # Discover Income schema (title + amount property names may vary)
     income_props = schemas["Income"]["properties"]
-    title_prop = next(
-        (n for n, p in income_props.items() if p["type"] == "title"), None
-    )
-    amount_prop = next(
-        (n for n, p in income_props.items() if p["type"] == "number"), None
-    )
-    notes_prop = next(
+    title_prop  = next((n for n, p in income_props.items() if p["type"] == "title"), None)
+    amount_prop = next((n for n, p in income_props.items() if p["type"] == "number"), None)
+    notes_prop  = next(
         (n for n, p in income_props.items()
-         if p["type"] == "rich_text" and "note" in n.lower()),
-        None,
+         if p["type"] == "rich_text" and "note" in n.lower()), None
     )
     if not title_prop or not amount_prop:
         raise RuntimeError(
-            f"Income DB: could not discover title/amount property. "
-            f"Properties found: {sorted(income_props.keys())}"
+            f"Income DB: can't discover title/amount. "
+            f"Found: {sorted(income_props.keys())}"
         )
-    INCOME_SCHEMA = IncomeSchema(
-        title_prop=title_prop,
-        amount_prop=amount_prop,
-        notes_prop=notes_prop,
-    )
-    print(
-        f"Income schema: title={title_prop!r}, amount={amount_prop!r}, "
-        f"notes={notes_prop!r}"
-    )
+    INCOME_SCHEMA = IncomeSchema(title_prop=title_prop, amount_prop=amount_prop,
+                                 notes_prop=notes_prop)
+    print(f"Income schema: title={title_prop!r} amount={amount_prop!r} notes={notes_prop!r}")
 
-    # Load accounts
     pages = notion_query_all(DB_ACCOUNTS)
     ACCOUNTS = []
     for page in pages:
         props = page["properties"]
-        name_parts = props["Name"]["title"]
-        name = name_parts[0]["plain_text"] if name_parts else ""
+        parts = props["Name"]["title"]
+        name = parts[0]["plain_text"] if parts else ""
         currency = (props["Currency"].get("select") or {}).get("name", "EGP")
         if name:
             ACCOUNTS.append(Account(page_id=page["id"], name=name, currency=currency))
     print(f"Loaded {len(ACCOUNTS)} account(s).")
 
-    # Load categories
     pages = notion_query_all(DB_CATEGORIES)
     CATEGORIES = []
     for page in pages:
         props = page["properties"]
-        name_parts = props["Name"]["title"]
-        name = name_parts[0]["plain_text"] if name_parts else ""
+        parts = props["Name"]["title"]
+        name = parts[0]["plain_text"] if parts else ""
         budget = props["Monthly Budget"].get("number") or 0.0
         if name:
-            CATEGORIES.append(
-                Category(page_id=page["id"], name=name, monthly_budget=budget)
-            )
+            CATEGORIES.append(Category(page_id=page["id"], name=name, monthly_budget=budget))
     print(f"Loaded {len(CATEGORIES)} categor(ies).")
 
 
@@ -245,25 +213,17 @@ def _categories_list_str() -> str:
 
 
 def resolve_account(query: str) -> tuple[Optional[Account], Optional[str]]:
-    """Return (account, None) on success, or (None, error_text) on failure."""
     q = query.strip().lstrip("@").lower()
-
-    # 1. Alias lookup → canonical name
     canonical_lower = ACCOUNT_ALIASES.get(q, q)
-
-    # 2. Exact case-insensitive match
     for acc in ACCOUNTS:
         if acc.name.lower() == canonical_lower:
             return acc, None
-
-    # 3. Fuzzy match against all account names (threshold 72)
     names = [a.name for a in ACCOUNTS]
     match = fuzz_process.extractOne(q, names, scorer=fuzz.WRatio, score_cutoff=72)
     if match:
         for acc in ACCOUNTS:
             if acc.name == match[0]:
                 return acc, None
-
     err = (
         f"❌ Account not found: '{query}'\n\n"
         f"Your accounts: {_accounts_list_str()}\n\n"
@@ -273,22 +233,16 @@ def resolve_account(query: str) -> tuple[Optional[Account], Optional[str]]:
 
 
 def resolve_category(query: str) -> tuple[Optional[Category], Optional[str]]:
-    """Return (category, None) on success, or (None, error_text) on failure."""
     q = query.strip().lower()
-
-    # Exact case-insensitive match
     for cat in CATEGORIES:
         if cat.name.lower() == q:
             return cat, None
-
-    # Fuzzy match (threshold 68 — slightly lower, categories are short words)
     names = [c.name for c in CATEGORIES]
     match = fuzz_process.extractOne(q, names, scorer=fuzz.WRatio, score_cutoff=68)
     if match:
         for cat in CATEGORIES:
             if cat.name == match[0]:
                 return cat, None
-
     err = (
         f"❌ Category not found: '{query}'\n\n"
         f"Your categories: {_categories_list_str()}\n\n"
@@ -298,13 +252,468 @@ def resolve_category(query: str) -> tuple[Optional[Category], Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Notion Bot State  (unchanged from Step 1)
+# Formatters
+# ---------------------------------------------------------------------------
+
+
+def fmt_amount(amount: float, currency: str) -> str:
+    n: int | float = int(amount) if amount == int(amount) else amount
+    return f"{n:,} {currency}"
+
+
+def _h(text: str) -> str:
+    """HTML-escape user-provided text."""
+    return html.escape(str(text))
+
+
+# ---------------------------------------------------------------------------
+# Parsers
+# ---------------------------------------------------------------------------
+
+
+def _parse_amount(token: str) -> tuple[Optional[float], Optional[str]]:
+    try:
+        v = float(token.replace(",", ""))
+        if v <= 0:
+            return None, f"Amount must be positive, got '{token}'"
+        return v, None
+    except ValueError:
+        return None, f"Invalid amount: '{token}'"
+
+
+def parse_expense(args: str) -> tuple[Optional[dict], Optional[str]]:
+    """
+    /e <amount> <category> <note> @account
+    Returns (parsed_dict, None) or (None, error_str).
+    """
+    tokens = args.split()
+    at_indices = [i for i, t in enumerate(tokens) if t.startswith("@")]
+    if not at_indices:
+        return None, (
+            "❌ Missing @account\n\n"
+            "Example:\n/e 350 Food lunch with team @cash"
+        )
+
+    acc_idx = at_indices[-1]
+    account_str = tokens[acc_idx].lstrip("@")
+    before = tokens[:acc_idx]
+
+    if len(before) < 2:
+        return None, (
+            "❌ Need at least: amount + category + @account\n\n"
+            "Example:\n/e 350 Food lunch with team @cash"
+        )
+
+    amount, err = _parse_amount(before[0])
+    if err:
+        return None, f"❌ {err}\n\nExample:\n/e 350 Food lunch with team @cash"
+
+    category_str = before[1]
+    note = " ".join(before[2:]).strip()
+
+    return {"amount": amount, "category": category_str,
+            "note": note, "account": account_str}, None
+
+
+def parse_income(args: str) -> tuple[Optional[dict], Optional[str]]:
+    """
+    /i <amount> <note> @account
+    Returns (parsed_dict, None) or (None, error_str).
+    """
+    tokens = args.split()
+    at_indices = [i for i, t in enumerate(tokens) if t.startswith("@")]
+    if not at_indices:
+        return None, (
+            "❌ Missing @account\n\n"
+            "Example:\n/i 15000 salary april @nbe"
+        )
+
+    acc_idx = at_indices[-1]
+    account_str = tokens[acc_idx].lstrip("@")
+    before = tokens[:acc_idx]
+
+    if not before:
+        return None, (
+            "❌ Missing amount\n\n"
+            "Example:\n/i 15000 salary april @nbe"
+        )
+
+    amount, err = _parse_amount(before[0])
+    if err:
+        return None, f"❌ {err}\n\nExample:\n/i 15000 salary april @nbe"
+
+    note = " ".join(before[1:]).strip()
+    return {"amount": amount, "note": note, "account": account_str}, None
+
+
+def parse_transfer(args: str) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Same-currency:  /t <amount> @from @to [note]
+    Cross-currency: /t <amount_out> @from <amount_in> @to [note]
+    Returns (parsed_dict, None) or (None, error_str).
+    """
+    tokens = args.split()
+    at_indices = [i for i, t in enumerate(tokens) if t.startswith("@")]
+
+    if len(at_indices) < 2:
+        return None, (
+            "❌ Need two accounts: @from and @to\n\n"
+            "Examples:\n"
+            "/t 2000 @nbe @cash ATM withdrawal\n"
+            "/t 100 @mashreq 4950 @cash USD to EGP"
+        )
+
+    from_idx = at_indices[0]
+    to_idx   = at_indices[1]
+    from_str = tokens[from_idx].lstrip("@")
+    to_str   = tokens[to_idx].lstrip("@")
+
+    before_from = tokens[:from_idx]
+    between     = tokens[from_idx + 1 : to_idx]
+    after_to    = tokens[to_idx + 1 :]
+
+    if not before_from:
+        return None, (
+            "❌ Missing amount before @from\n\n"
+            "Examples:\n"
+            "/t 2000 @nbe @cash\n"
+            "/t 100 @mashreq 4950 @cash USD to EGP"
+        )
+
+    amount_out, err = _parse_amount(before_from[0])
+    if err:
+        return None, f"❌ {err}\n\nExample:\n/t 2000 @nbe @cash"
+
+    # Cross-currency: first token between @from and @to is a number
+    amount_in: Optional[float] = None
+    note_tokens: list[str] = list(after_to)
+
+    if between:
+        candidate, _ = _parse_amount(between[0])
+        if candidate is not None:
+            amount_in = candidate
+            note_tokens = list(after_to)
+        else:
+            note_tokens = list(between) + list(after_to)
+
+    return {
+        "amount_out": amount_out,
+        "amount_in":  amount_in,   # None → same-currency
+        "from_account": from_str,
+        "to_account":   to_str,
+        "note": " ".join(note_tokens).strip(),
+    }, None
+
+
+# ---------------------------------------------------------------------------
+# Notion writes
+# ---------------------------------------------------------------------------
+
+today = date.today().isoformat()  # Set once per run
+
+
+def _notion_rich_text(text: str) -> list[dict]:
+    return [{"type": "text", "text": {"content": text}}] if text else []
+
+
+def notion_create_expense(
+    amount: float, account: Account, category: Category, note: str
+) -> dict:
+    title = note or f"{fmt_amount(amount, account.currency)} {category.name}"
+    props: dict = {
+        "Expense":      {"title": [{"text": {"content": title}}]},
+        "Total Amount": {"number": amount},
+        "Date":         {"date": {"start": today}},
+        "Accounts":     {"relation": [{"id": account.page_id}]},
+        "Categories":   {"relation": [{"id": category.page_id}]},
+    }
+    if note:
+        props["Notes"] = {"rich_text": _notion_rich_text(note)}
+    page = notion.pages.create(parent={"database_id": DB_EXPENSES}, properties=props)
+    return page
+
+
+def notion_create_income(amount: float, account: Account, note: str) -> dict:
+    title = note or fmt_amount(amount, account.currency)
+    props: dict = {
+        INCOME_SCHEMA.title_prop:  {"title": [{"text": {"content": title}}]},
+        INCOME_SCHEMA.amount_prop: {"number": amount},
+        "Date":     {"date": {"start": today}},
+        "Accounts": {"relation": [{"id": account.page_id}]},
+    }
+    if note and INCOME_SCHEMA.notes_prop:
+        props[INCOME_SCHEMA.notes_prop] = {"rich_text": _notion_rich_text(note)}
+    page = notion.pages.create(parent={"database_id": DB_INCOME}, properties=props)
+    return page
+
+
+def notion_create_transfer(
+    amount_out: float, amount_in: float,
+    from_acc: Account, to_acc: Account, note: str
+) -> dict:
+    title = note or f"{from_acc.name} → {to_acc.name}"
+    page = notion.pages.create(
+        parent={"database_id": DB_TRANSFER},
+        properties={
+            "Name":         {"title": [{"text": {"content": title}}]},
+            "Date":         {"date": {"start": today}},
+            "Amount Out":   {"number": amount_out},
+            "Amount In":    {"number": amount_in},
+            "From Account": {"relation": [{"id": from_acc.page_id}]},
+            "To Account":   {"relation": [{"id": to_acc.page_id}]},
+        },
+    )
+    return page
+
+
+# ---------------------------------------------------------------------------
+# Receipt builders
+# ---------------------------------------------------------------------------
+
+
+def receipt_expense(amount: float, account: Account, category: Category,
+                    note: str, page_url: str) -> str:
+    rows = [
+        ("💰", "Amount",   fmt_amount(amount, account.currency)),
+        ("🏷", "Category", category.name),
+        ("🏦", "Account",  account.name),
+    ]
+    if note:
+        rows.append(("📝", "Note", note))
+    rows.append(("📅", "Date", today))
+    lines = ["✅ <b>Expense logged</b>\n"]
+    for emoji, label, value in rows:
+        lines.append(f"{emoji} {label}:  {_h(value)}")
+    lines += ["\n↩️ /undo to reverse", f'🔗 <a href="{page_url}">View in Notion</a>']
+    return "\n".join(lines)
+
+
+def receipt_income(amount: float, account: Account, note: str, page_url: str) -> str:
+    rows = [
+        ("💰", "Amount",  fmt_amount(amount, account.currency)),
+        ("🏦", "Account", account.name),
+    ]
+    if note:
+        rows.append(("📝", "Note", note))
+    rows.append(("📅", "Date", today))
+    lines = ["✅ <b>Income logged</b>\n"]
+    for emoji, label, value in rows:
+        lines.append(f"{emoji} {label}:  {_h(value)}")
+    lines += ["\n↩️ /undo to reverse", f'🔗 <a href="{page_url}">View in Notion</a>']
+    return "\n".join(lines)
+
+
+def receipt_transfer(
+    amount_out: float, amount_in: float,
+    from_acc: Account, to_acc: Account,
+    note: str, page_url: str,
+) -> str:
+    cross = from_acc.currency != to_acc.currency
+    lines = ["✅ <b>Transfer logged</b>\n"]
+    lines.append(f"🏦 From:  {_h(from_acc.name)} ({from_acc.currency})")
+    lines.append(f"🏦 To:    {_h(to_acc.name)} ({to_acc.currency})")
+    if cross:
+        lines.append(f"💸 Out:   {_h(fmt_amount(amount_out, from_acc.currency))}")
+        lines.append(f"💸 In:    {_h(fmt_amount(amount_in,  to_acc.currency))}")
+    else:
+        lines.append(f"💸 Amount: {_h(fmt_amount(amount_out, from_acc.currency))}")
+    if note:
+        lines.append(f"📝 Note:  {_h(note)}")
+    lines.append(f"📅 Date:  {today}")
+    lines += ["\n↩️ /undo to reverse", f'🔗 <a href="{page_url}">View in Notion</a>']
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Command handlers  — return (reply, page_id_or_None, db_name_or_None)
+# ---------------------------------------------------------------------------
+
+PageInfo = tuple[str, str]   # (page_id, database_name)
+CmdResult = tuple[str, Optional[PageInfo]]
+
+
+def cmd_expense(args: str) -> CmdResult:
+    parsed, err = parse_expense(args)
+    if err:
+        return err, None
+
+    account, err = resolve_account(parsed["account"])
+    if err:
+        return err, None
+
+    category, err = resolve_category(parsed["category"])
+    if err:
+        return err, None
+
+    try:
+        page = notion_create_expense(
+            parsed["amount"], account, category, parsed["note"]
+        )
+    except Exception as e:
+        return f"❌ Notion write failed: {_h(str(e))}", None
+
+    url = page.get("url", "")
+    receipt = receipt_expense(
+        parsed["amount"], account, category, parsed["note"], url
+    )
+    return receipt, (page["id"], "expenses")
+
+
+def cmd_income(args: str) -> CmdResult:
+    parsed, err = parse_income(args)
+    if err:
+        return err, None
+
+    account, err = resolve_account(parsed["account"])
+    if err:
+        return err, None
+
+    try:
+        page = notion_create_income(parsed["amount"], account, parsed["note"])
+    except Exception as e:
+        return f"❌ Notion write failed: {_h(str(e))}", None
+
+    url = page.get("url", "")
+    receipt = receipt_income(parsed["amount"], account, parsed["note"], url)
+    return receipt, (page["id"], "income")
+
+
+def cmd_transfer(args: str) -> CmdResult:
+    parsed, err = parse_transfer(args)
+    if err:
+        return err, None
+
+    from_acc, err = resolve_account(parsed["from_account"])
+    if err:
+        return err, None
+
+    to_acc, err = resolve_account(parsed["to_account"])
+    if err:
+        return err, None
+
+    amount_out: float = parsed["amount_out"]
+    amount_in_raw: Optional[float] = parsed["amount_in"]
+
+    cross_currency = from_acc.currency != to_acc.currency
+
+    if cross_currency:
+        if amount_in_raw is None:
+            return (
+                f"❌ {_h(from_acc.name)} ({from_acc.currency}) → "
+                f"{_h(to_acc.name)} ({to_acc.currency}) is a cross-currency transfer.\n"
+                f"Both amounts are required.\n\n"
+                f"Example:\n"
+                f"/t 100 @mashreq 4950 @cash USD to EGP"
+            ), None
+        amount_in = amount_in_raw
+    else:
+        amount_in = amount_out   # same-currency: amounts are equal
+
+    try:
+        page = notion_create_transfer(
+            amount_out, amount_in, from_acc, to_acc, parsed["note"]
+        )
+    except Exception as e:
+        return f"❌ Notion write failed: {_h(str(e))}", None
+
+    url = page.get("url", "")
+    receipt = receipt_transfer(
+        amount_out, amount_in, from_acc, to_acc, parsed["note"], url
+    )
+    return receipt, (page["id"], "transfer")
+
+
+def cmd_accounts() -> str:
+    from collections import defaultdict
+    by_currency: dict[str, list[str]] = defaultdict(list)
+    for acc in sorted(ACCOUNTS, key=lambda a: a.name):
+        by_currency[acc.currency].append(acc.name)
+    lines = ["<b>📊 Accounts</b>\n"]
+    for currency in sorted(by_currency.keys()):
+        flag = CURRENCY_FLAG.get(currency, "💰")
+        lines.append(f"{flag} <b>{currency}</b>")
+        for name in by_currency[currency]:
+            lines.append(f"  · {_h(name)}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def cmd_help() -> str:
+    return (
+        "<b>Finance Bot — Commands</b>\n\n"
+        "<b>Logging</b>\n"
+        "<code>/e 350 Food lunch @cash</code> — expense\n"
+        "<code>/i 15000 salary april @nbe</code> — income\n"
+        "<code>/t 2000 @nbe @cash</code> — transfer (same currency)\n"
+        "<code>/t 100 @mashreq 4950 @cash</code> — transfer (cross-currency)\n\n"
+        "<b>Balances</b>\n"
+        "<code>/b</code> — all accounts\n"
+        "<code>/b @nbe</code> — single account\n\n"
+        "<b>Spending</b>\n"
+        "<code>/s</code> — this month vs budget\n"
+        "<code>/s 2026-05</code> — specific month\n\n"
+        "<b>Other</b>\n"
+        "<code>/accounts</code> — full account list\n"
+        "<code>/undo</code> — archive last bot entry\n"
+        "<code>/help</code> — this message\n\n"
+        "<i>Free text also works:</i>\n"
+        "<code>spent 250 on groceries @cash</code>\n"
+        "<code>got paid 15000 salary @nbe</code>\n"
+        "<code>transferred 2000 from nbe to cash</code>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Message routing
+# ---------------------------------------------------------------------------
+
+
+def handle_message(msg: dict, state: dict) -> str:
+    text = msg.get("text", "").strip()
+
+    if text == "/accounts":
+        return cmd_accounts()
+
+    if text == "/help":
+        return cmd_help()
+
+    if text.startswith("/e ") or text == "/e":
+        reply, page_info = cmd_expense(text[2:].strip())
+        if page_info:
+            state["last_page_id"], state["last_database"] = page_info
+        return reply
+
+    if text.startswith("/i ") or text == "/i":
+        reply, page_info = cmd_income(text[2:].strip())
+        if page_info:
+            state["last_page_id"], state["last_database"] = page_info
+        return reply
+
+    if text.startswith("/t ") or text == "/t":
+        reply, page_info = cmd_transfer(text[2:].strip())
+        if page_info:
+            state["last_page_id"], state["last_database"] = page_info
+        return reply
+
+    # Fallback — free text handled in Step 6
+    return (
+        "🤔 I didn't understand that.\n\n"
+        "Try:\n"
+        "<code>/e 350 Food lunch @cash</code>\n"
+        "<code>/i 15000 salary @nbe</code>\n"
+        "<code>/t 2000 @nbe @cash</code>\n"
+        "or send /help"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Notion Bot State
 # ---------------------------------------------------------------------------
 
 DEFAULT_STATE: dict = {
     "last_update_id": 0,
-    "last_page_id": None,
-    "last_database": None,
+    "last_page_id":   None,
+    "last_database":  None,
 }
 
 
@@ -379,16 +788,14 @@ BOT_COMMANDS = [
 
 
 def register_commands() -> None:
-    """Push the command menu to Telegram (idempotent)."""
     resp = requests.post(
         f"{TELEGRAM_API}/setMyCommands",
         json={"commands": BOT_COMMANDS},
         timeout=15,
     )
     resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"setMyCommands error: {data}")
+    if not resp.json().get("ok"):
+        raise RuntimeError(f"setMyCommands error: {resp.json()}")
     print("Command menu registered.")
 
 
@@ -406,76 +813,16 @@ def tg_get(method: str, **params) -> dict:
     return data
 
 
-def tg_send(chat_id: int, text: str, parse_mode: str = "Markdown") -> None:
+def tg_send(chat_id: int, text: str, parse_mode: str = "HTML") -> None:
     resp = requests.post(
         f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
+        json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
+              "disable_web_page_preview": True},
         timeout=20,
     )
     resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"sendMessage error: {data}")
-
-
-# ---------------------------------------------------------------------------
-# Command handlers
-# ---------------------------------------------------------------------------
-
-
-def cmd_accounts() -> str:
-    from collections import defaultdict
-
-    by_currency: dict[str, list[str]] = defaultdict(list)
-    for acc in sorted(ACCOUNTS, key=lambda a: a.name):
-        by_currency[acc.currency].append(acc.name)
-
-    lines = ["📊 *Accounts*\n"]
-    for currency in sorted(by_currency.keys()):
-        flag = CURRENCY_FLAG.get(currency, "💰")
-        lines.append(f"{flag} *{currency}*")
-        for name in by_currency[currency]:
-            lines.append(f"  · {name}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-def cmd_help() -> str:
-    return (
-        "*Finance Bot — Commands*\n\n"
-        "*Logging*\n"
-        "`/e 350 Food lunch @cash` — expense\n"
-        "`/i 15000 salary april @nbe` — income\n"
-        "`/t 2000 @nbe @cash` — transfer (same currency)\n"
-        "`/t 100 @mashreq 4950 @cash` — transfer (cross-currency)\n\n"
-        "*Balances*\n"
-        "`/b` — all accounts\n"
-        "`/b @nbe` — single account\n\n"
-        "*Spending*\n"
-        "`/s` — this month vs budget\n"
-        "`/s 2026-05` — specific month\n\n"
-        "*Other*\n"
-        "`/accounts` — full account list\n"
-        "`/undo` — archive last bot entry\n"
-        "`/help` — this message\n\n"
-        "_Free text also works:_\n"
-        "`spent 250 on groceries @cash`\n"
-        "`got paid 15000 salary @nbe`\n"
-        "`transferred 2000 from nbe to cash`"
-    )
-
-
-def handle_message(msg: dict) -> str:
-    text = msg.get("text", "").strip()
-
-    if text == "/accounts":
-        return cmd_accounts()
-
-    if text == "/help":
-        return cmd_help()
-
-    # Fallback echo (replaced in Steps 3–6)
-    return f"✅ Bot received: {text}"
+    if not resp.json().get("ok"):
+        raise RuntimeError(f"sendMessage error: {resp.json()}")
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +831,6 @@ def handle_message(msg: dict) -> str:
 
 
 def main() -> None:
-    # Startup
     register_commands()
     validate_and_load_schemas()
 
@@ -521,7 +867,7 @@ def main() -> None:
             continue
 
         try:
-            reply = handle_message(msg)
+            reply = handle_message(msg, state)
             tg_send(chat_id, reply)
             print(f"Replied to update {update_id}.")
         except Exception:
@@ -529,11 +875,7 @@ def main() -> None:
             failures.append((update_id, err))
             print(f"ERROR on update {update_id}:\n{err}")
             try:
-                tg_send(
-                    chat_id,
-                    "⚠️ Internal error processing your message. Please try again.",
-                    parse_mode="",
-                )
+                tg_send(chat_id, "⚠️ Internal error. Please try again.", parse_mode="")
             except Exception:
                 pass
 
@@ -542,7 +884,7 @@ def main() -> None:
     print(f"State saved. last_update_id={new_offset}")
 
     if failures:
-        print(f"\n{len(failures)} message(s) failed:")
+        print(f"\n{len(failures)} failure(s):")
         for uid, err in failures:
             print(f"  update_id={uid}: {err}")
         sys.exit(1)
