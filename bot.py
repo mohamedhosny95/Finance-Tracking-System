@@ -88,6 +88,7 @@ class Account:
     page_id: str
     name: str
     currency: str
+    initial_amount: float = 0.0
 
 
 @dataclass
@@ -165,7 +166,7 @@ def validate_and_load_schemas() -> None:
     amount_prop = next((n for n, p in income_props.items() if p["type"] == "number"), None)
     notes_prop  = next(
         (n for n, p in income_props.items()
-         if p["type"] == "rich_text" and "note" in n.lower()), None
+         if p["type"] in ("rich_text", "text") and "note" in n.lower()), None
     )
     if not title_prop or not amount_prop:
         raise RuntimeError(
@@ -181,10 +182,12 @@ def validate_and_load_schemas() -> None:
     for page in pages:
         props = page["properties"]
         parts = props["Name"]["title"]
-        name = parts[0]["plain_text"] if parts else ""
+        name = parts[0]["plain_text"].strip() if parts else ""
         currency = (props["Currency"].get("select") or {}).get("name", "EGP")
+        initial = props["Initial Amount"].get("number") or 0.0
         if name:
-            ACCOUNTS.append(Account(page_id=page["id"], name=name, currency=currency))
+            ACCOUNTS.append(Account(page_id=page["id"], name=name,
+                                    currency=currency, initial_amount=initial))
     print(f"Loaded {len(ACCOUNTS)} account(s).")
 
     pages = notion_query_all(DB_CATEGORIES)
@@ -192,7 +195,7 @@ def validate_and_load_schemas() -> None:
     for page in pages:
         props = page["properties"]
         parts = props["Name"]["title"]
-        name = parts[0]["plain_text"] if parts else ""
+        name = parts[0]["plain_text"].strip() if parts else ""
         budget = props["Monthly Budget"].get("number") or 0.0
         if name:
             CATEGORIES.append(Category(page_id=page["id"], name=name, monthly_budget=budget))
@@ -246,7 +249,7 @@ def resolve_category(query: str) -> tuple[Optional[Category], Optional[str]]:
     err = (
         f"❌ Category not found: '{query}'\n\n"
         f"Your categories: {_categories_list_str()}\n\n"
-        f"Example:\n/e 350 Food lunch with team @cash"
+        f"Example:\n/e 350 Food&Groceries groceries @cash"
     )
     return None, err
 
@@ -291,7 +294,7 @@ def parse_expense(args: str) -> tuple[Optional[dict], Optional[str]]:
     if not at_indices:
         return None, (
             "❌ Missing @account\n\n"
-            "Example:\n/e 350 Food lunch with team @cash"
+            "Example:\n/e 350 Transportation uber @cash"
         )
 
     acc_idx = at_indices[-1]
@@ -301,12 +304,12 @@ def parse_expense(args: str) -> tuple[Optional[dict], Optional[str]]:
     if len(before) < 2:
         return None, (
             "❌ Need at least: amount + category + @account\n\n"
-            "Example:\n/e 350 Food lunch with team @cash"
+            "Example:\n/e 350 Transportation uber @cash"
         )
 
     amount, err = _parse_amount(before[0])
     if err:
-        return None, f"❌ {err}\n\nExample:\n/e 350 Food lunch with team @cash"
+        return None, f"❌ {err}\n\nExample:\n/e 350 Transportation uber @cash"
 
     category_str = before[1]
     note = " ".join(before[2:]).strip()
@@ -623,6 +626,116 @@ def cmd_transfer(args: str) -> CmdResult:
     return receipt, (page["id"], "transfer")
 
 
+# ---------------------------------------------------------------------------
+# Balance computation  (spec: never read rollup/formula — compute ourselves)
+# ---------------------------------------------------------------------------
+
+
+def _sum_number_prop(pages: list[dict], prop: str) -> float:
+    total = 0.0
+    for page in pages:
+        total += page["properties"][prop].get("number") or 0.0
+    return total
+
+
+def _rel_filter(prop: str, page_id: str) -> dict:
+    return {"property": prop, "relation": {"contains": page_id}}
+
+
+def compute_balance(account: Account) -> float:
+    """Compute balance for a single account via four filtered DB queries."""
+    acc_id = account.page_id
+    balance = account.initial_amount
+
+    balance += _sum_number_prop(
+        notion_query_all(DB_INCOME, filter=_rel_filter("Accounts", acc_id)),
+        INCOME_SCHEMA.amount_prop,
+    )
+    balance -= _sum_number_prop(
+        notion_query_all(DB_EXPENSES, filter=_rel_filter("Accounts", acc_id)),
+        "Total Amount",
+    )
+    balance -= _sum_number_prop(
+        notion_query_all(DB_TRANSFER, filter=_rel_filter("From Account", acc_id)),
+        "Amount Out",
+    )
+    balance += _sum_number_prop(
+        notion_query_all(DB_TRANSFER, filter=_rel_filter("To Account", acc_id)),
+        "Amount In",
+    )
+    return balance
+
+
+def compute_all_balances() -> dict[str, float]:
+    """
+    Compute balances for all accounts in 3 DB scans instead of 4×N queries.
+    Returns {page_id: balance}.
+    """
+    balances = {acc.page_id: acc.initial_amount for acc in ACCOUNTS}
+
+    for page in notion_query_all(DB_INCOME):
+        amt = page["properties"][INCOME_SCHEMA.amount_prop].get("number") or 0.0
+        for rel in page["properties"]["Accounts"]["relation"]:
+            if rel["id"] in balances:
+                balances[rel["id"]] += amt
+
+    for page in notion_query_all(DB_EXPENSES):
+        amt = page["properties"]["Total Amount"].get("number") or 0.0
+        for rel in page["properties"]["Accounts"]["relation"]:
+            if rel["id"] in balances:
+                balances[rel["id"]] -= amt
+
+    for page in notion_query_all(DB_TRANSFER):
+        amt_out = page["properties"]["Amount Out"].get("number") or 0.0
+        amt_in  = page["properties"]["Amount In"].get("number") or 0.0
+        for rel in page["properties"]["From Account"]["relation"]:
+            if rel["id"] in balances:
+                balances[rel["id"]] -= amt_out
+        for rel in page["properties"]["To Account"]["relation"]:
+            if rel["id"] in balances:
+                balances[rel["id"]] += amt_in
+
+    return balances
+
+
+def cmd_balance(args: str) -> str:
+    """
+    /b           → all accounts grouped by currency
+    /b @account  → single account
+    """
+    args = args.strip()
+
+    if args:
+        # Single account
+        account, err = resolve_account(args)
+        if err:
+            return err
+        balance = compute_balance(account)
+        flag = CURRENCY_FLAG.get(account.currency, "💰")
+        return (
+            f"🏦 <b>{_h(account.name)}</b> ({account.currency}) {flag}\n\n"
+            f"💰 Balance: <b>{_h(fmt_amount(balance, account.currency))}</b>"
+        )
+
+    # All accounts — batch scan
+    from collections import defaultdict
+    all_bal = compute_all_balances()
+
+    by_currency: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for acc in sorted(ACCOUNTS, key=lambda a: a.name):
+        bal = all_bal.get(acc.page_id, acc.initial_amount)
+        by_currency[acc.currency].append((acc.name, bal))
+
+    lines = ["📊 <b>Balances</b>\n"]
+    for currency in sorted(by_currency.keys()):
+        flag = CURRENCY_FLAG.get(currency, "💰")
+        lines.append(f"{flag} <b>{currency}</b>")
+        for name, bal in by_currency[currency]:
+            lines.append(f"  · {_h(name)}: {_h(fmt_amount(bal, currency))}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def cmd_accounts() -> str:
     from collections import defaultdict
     by_currency: dict[str, list[str]] = defaultdict(list)
@@ -642,8 +755,8 @@ def cmd_help() -> str:
     return (
         "<b>Finance Bot — Commands</b>\n\n"
         "<b>Logging</b>\n"
-        "<code>/e 350 Food lunch @cash</code> — expense\n"
-        "<code>/i 15000 salary april @nbe</code> — income\n"
+        "<code>/e 350 Transportation uber @cash</code> — expense\n"
+        "<code>/i 15000 salary june @nbe</code> — income\n"
         "<code>/t 2000 @nbe @cash</code> — transfer (same currency)\n"
         "<code>/t 100 @mashreq 4950 @cash</code> — transfer (cross-currency)\n\n"
         "<b>Balances</b>\n"
@@ -695,14 +808,17 @@ def handle_message(msg: dict, state: dict) -> str:
             state["last_page_id"], state["last_database"] = page_info
         return reply
 
+    if text.startswith("/b ") or text == "/b":
+        return cmd_balance(text[2:].strip())
+
     # Fallback — free text handled in Step 6
     return (
         "🤔 I didn't understand that.\n\n"
         "Try:\n"
-        "<code>/e 350 Food lunch @cash</code>\n"
-        "<code>/i 15000 salary @nbe</code>\n"
+        "<code>/e 350 Transportation uber @cash</code>\n"
+        "<code>/i 15000 salary june @nbe</code>\n"
         "<code>/t 2000 @nbe @cash</code>\n"
-        "or send /help"
+        "or /help"
     )
 
 
