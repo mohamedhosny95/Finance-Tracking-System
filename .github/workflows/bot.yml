@@ -1,0 +1,31 @@
+name: Finance Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ALLOWED_TELEGRAM_USER_ID: ${{ secrets.ALLOWED_TELEGRAM_USER_ID }}
+          BOT_STATE_PAGE_ID: ${{ secrets.BOT_STATE_PAGE_ID }}
+        run: python bot.py
