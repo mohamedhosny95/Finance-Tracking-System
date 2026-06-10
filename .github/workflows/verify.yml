@@ -2,6 +2,10 @@ name: Verify Balances
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - verify_balances.py
+      - .github/workflows/verify.yml
 
 jobs:
   verify:
@@ -26,3 +30,11 @@ jobs:
           ALLOWED_TELEGRAM_USER_ID: ${{ secrets.ALLOWED_TELEGRAM_USER_ID }}
           BOT_STATE_PAGE_ID: ${{ secrets.BOT_STATE_PAGE_ID }}
         run: python verify_balances.py
+
+      - name: Run the bot once (Telegram round-trip proof)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          ALLOWED_TELEGRAM_USER_ID: ${{ secrets.ALLOWED_TELEGRAM_USER_ID }}
+          BOT_STATE_PAGE_ID: ${{ secrets.BOT_STATE_PAGE_ID }}
+        run: python bot.py
