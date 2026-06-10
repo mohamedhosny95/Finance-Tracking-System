@@ -363,6 +363,36 @@ def save_bot_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Telegram command menu
+# ---------------------------------------------------------------------------
+
+BOT_COMMANDS = [
+    {"command": "e",        "description": "💸 Log expense  →  /e 350 Food lunch @cash"},
+    {"command": "i",        "description": "💰 Log income   →  /i 15000 salary @nbe"},
+    {"command": "t",        "description": "🔄 Transfer     →  /t 2000 @nbe @cash"},
+    {"command": "b",        "description": "📊 Balances     →  /b  or  /b @nbe"},
+    {"command": "s",        "description": "📈 Spending     →  /s  or  /s 2026-05"},
+    {"command": "accounts", "description": "🏦 All accounts with currency"},
+    {"command": "undo",     "description": "↩️ Undo the last entry the bot created"},
+    {"command": "help",     "description": "❓ All commands with examples"},
+]
+
+
+def register_commands() -> None:
+    """Push the command menu to Telegram (idempotent)."""
+    resp = requests.post(
+        f"{TELEGRAM_API}/setMyCommands",
+        json={"commands": BOT_COMMANDS},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"setMyCommands error: {data}")
+    print("Command menu registered.")
+
+
+# ---------------------------------------------------------------------------
 # Telegram helpers
 # ---------------------------------------------------------------------------
 
@@ -412,10 +442,26 @@ def cmd_accounts() -> str:
 
 def cmd_help() -> str:
     return (
-        "*Available commands*\n\n"
-        "`/accounts` — list all accounts with currency\n"
+        "*Finance Bot — Commands*\n\n"
+        "*Logging*\n"
+        "`/e 350 Food lunch @cash` — expense\n"
+        "`/i 15000 salary april @nbe` — income\n"
+        "`/t 2000 @nbe @cash` — transfer (same currency)\n"
+        "`/t 100 @mashreq 4950 @cash` — transfer (cross-currency)\n\n"
+        "*Balances*\n"
+        "`/b` — all accounts\n"
+        "`/b @nbe` — single account\n\n"
+        "*Spending*\n"
+        "`/s` — this month vs budget\n"
+        "`/s 2026-05` — specific month\n\n"
+        "*Other*\n"
+        "`/accounts` — full account list\n"
+        "`/undo` — archive last bot entry\n"
         "`/help` — this message\n\n"
-        "_More commands coming soon…_"
+        "_Free text also works:_\n"
+        "`spent 250 on groceries @cash`\n"
+        "`got paid 15000 salary @nbe`\n"
+        "`transferred 2000 from nbe to cash`"
     )
 
 
@@ -438,7 +484,8 @@ def handle_message(msg: dict) -> str:
 
 
 def main() -> None:
-    # Startup: validate schemas and populate caches
+    # Startup
+    register_commands()
     validate_and_load_schemas()
 
     state = load_bot_state()
