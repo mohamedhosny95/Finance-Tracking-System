@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - verify_balances.py
+      - bot.py
+      - requirements.txt
       - .github/workflows/verify.yml
 
 jobs:

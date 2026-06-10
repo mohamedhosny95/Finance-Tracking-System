@@ -20,10 +20,29 @@ from rapidfuzz import fuzz, process as fuzz_process
 # Config
 # ---------------------------------------------------------------------------
 
-TELEGRAM_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
-NOTION_KEY        = os.environ["NOTION_API_KEY"]
-ALLOWED_USER_ID   = int(os.environ["ALLOWED_TELEGRAM_USER_ID"])
-BOT_STATE_PAGE_ID = os.environ["BOT_STATE_PAGE_ID"]
+def _env(name: str) -> str:
+    """Read env var, tolerating accidental quotes/whitespace from copy-paste."""
+    return os.environ[name].strip().strip("'\"").strip()
+
+
+def _env_int(name: str) -> int:
+    raw = _env(name)
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"CONFIG ERROR: {name} must be a plain numeric Telegram user ID.\n"
+            f"Get yours by messaging @userinfobot on Telegram — it replies\n"
+            f"with a number like 123456789. Put exactly that number in the\n"
+            f"GitHub Secret (no quotes, no @username).\n"
+            f"Current value is not a valid integer (length {len(raw)})."
+        )
+
+
+TELEGRAM_TOKEN    = _env("TELEGRAM_BOT_TOKEN")
+NOTION_KEY        = _env("NOTION_API_KEY")
+ALLOWED_USER_ID   = _env_int("ALLOWED_TELEGRAM_USER_ID")
+BOT_STATE_PAGE_ID = _env("BOT_STATE_PAGE_ID")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -737,6 +756,129 @@ def cmd_balance(args: str) -> str:
     return "\n".join(lines).strip()
 
 
+# ---------------------------------------------------------------------------
+# /s — monthly spending vs budget
+# ---------------------------------------------------------------------------
+
+
+def fmt_num(n: float) -> str:
+    v: int | float = int(n) if n == int(n) else round(n, 2)
+    return f"{v:,}"
+
+
+def cmd_spending(args: str) -> str:
+    """
+    /s          → current month (Cairo time)
+    /s 2026-05  → specific month
+    """
+    args = args.strip()
+    if args:
+        try:
+            parts = args.split("-")
+            if len(parts) != 2:
+                raise ValueError
+            year, month = int(parts[0]), int(parts[1])
+            datetime(year, month, 1)
+        except (ValueError, TypeError):
+            return (
+                f"❌ Invalid month: '{_h(args)}'\n\n"
+                f"Format is YYYY-MM.\n\n"
+                f"Example:\n/s 2026-05"
+            )
+    else:
+        now = datetime.now(CAIRO_TZ)
+        year, month = now.year, now.month
+
+    import calendar
+    last_day = calendar.monthrange(year, month)[1]
+    start = f"{year:04d}-{month:02d}-01"
+    end = f"{year:04d}-{month:02d}-{last_day:02d}"
+
+    pages = notion_query_all(DB_EXPENSES, filter={"and": [
+        {"property": "Date", "date": {"on_or_after": start}},
+        {"property": "Date", "date": {"on_or_before": end}},
+    ]})
+
+    spent: dict[str, float] = {c.page_id: 0.0 for c in CATEGORIES}
+    uncategorized = 0.0
+    total = 0.0
+    for page in pages:
+        amt = page["properties"]["Total Amount"].get("number") or 0.0
+        total += amt
+        rels = page["properties"]["Categories"]["relation"]
+        if not rels:
+            uncategorized += amt
+        for rel in rels:
+            if rel["id"] in spent:
+                spent[rel["id"]] += amt
+
+    month_label = f"{year:04d}-{month:02d}"
+    lines = [f"📈 <b>Spending — {month_label}</b>\n"]
+
+    rows = [(c, spent[c.page_id]) for c in CATEGORIES
+            if spent[c.page_id] > 0 or c.monthly_budget > 0]
+    rows.sort(key=lambda r: r[1], reverse=True)
+
+    if not rows and uncategorized == 0:
+        return (
+            f"📈 <b>Spending — {month_label}</b>\n\n"
+            f"No expenses recorded this month.\n\n"
+            f"Example:\n/e 350 Transportation uber @cash"
+        )
+
+    for cat, amount in rows:
+        if cat.monthly_budget > 0:
+            pct = amount / cat.monthly_budget * 100
+            mark = "🔴" if pct > 100 else ("⚠️" if pct >= 80 else "✅")
+            lines.append(
+                f"{mark} {_h(cat.name)}: "
+                f"{fmt_num(amount)} / {fmt_num(cat.monthly_budget)} ({pct:.0f}%)"
+            )
+        else:
+            lines.append(f"▫️ {_h(cat.name)}: {fmt_num(amount)} (no budget)")
+
+    if uncategorized > 0:
+        lines.append(f"▫️ Uncategorized: {fmt_num(uncategorized)}")
+
+    lines.append(f"\n💸 <b>Total: {fmt_num(total)}</b>")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /undo
+# ---------------------------------------------------------------------------
+
+DB_LABELS = {"expenses": "Expense", "income": "Income", "transfer": "Transfer"}
+
+
+def cmd_undo(state: dict) -> str:
+    page_id = state.get("last_page_id")
+    db = state.get("last_database")
+
+    if not page_id:
+        return (
+            "🤷 Nothing to undo — no record created recently.\n\n"
+            "Example:\n/e 350 Transportation uber @cash\n"
+            "then /undo to reverse it"
+        )
+
+    try:
+        resp = notion.pages.update(page_id=page_id, archived=True)
+    except Exception as e:
+        return (
+            f"❌ Undo failed: {_h(str(e))}\n\n"
+            f"The record may have been deleted manually already."
+        )
+
+    if resp.get("archived") is not True:
+        return "❌ Undo failed: Notion did not archive the record."
+
+    state["last_page_id"] = None
+    state["last_database"] = None
+    label = DB_LABELS.get(db, db or "Record")
+    return f"↩️ <b>{label} deleted</b> — moved to Notion trash."
+
+
 def cmd_accounts() -> str:
     from collections import defaultdict
     by_currency: dict[str, list[str]] = defaultdict(list)
@@ -811,6 +953,15 @@ def handle_message(msg: dict, state: dict) -> str:
 
     if text.startswith("/b ") or text == "/b":
         return cmd_balance(text[2:].strip())
+
+    if text.startswith("/s ") or text == "/s":
+        return cmd_spending(text[2:].strip())
+
+    if text == "/undo":
+        return cmd_undo(state)
+
+    if text == "/start":
+        return cmd_help()
 
     # Fallback — free text handled in Step 6
     return (
