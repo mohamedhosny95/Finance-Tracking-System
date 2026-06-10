@@ -9,7 +9,7 @@ import os
 import sys
 import traceback
 from dataclasses import dataclass
-from datetime import date
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -412,7 +412,8 @@ def parse_transfer(args: str) -> tuple[Optional[dict], Optional[str]]:
 # Notion writes
 # ---------------------------------------------------------------------------
 
-today = date.today().isoformat()  # Set once per run
+CAIRO_TZ = timezone(timedelta(hours=2))
+today = datetime.now(CAIRO_TZ).date().isoformat()  # Set once per run, Cairo time
 
 
 def _notion_rich_text(text: str) -> list[dict]:
