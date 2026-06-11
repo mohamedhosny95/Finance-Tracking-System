@@ -172,6 +172,11 @@ def validate_and_load_schemas() -> None:
     schemas = {label: notion.databases.retrieve(database_id=db_id)
                for label, db_id in db_map.items()}
 
+    for label, resp in schemas.items():
+        obj_type = resp.get("object", "MISSING")
+        props_keys = list(resp.get("properties", {}).keys())
+        print(f"[DEBUG] {label}: object={obj_type!r}, properties keys={props_keys[:8]}")
+
     errors: list[str] = []
     for label, required in REQUIRED_PROPS.items():
         props = schemas[label].get("properties", {})
