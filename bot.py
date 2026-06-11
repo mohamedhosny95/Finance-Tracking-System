@@ -168,23 +168,30 @@ def validate_and_load_schemas() -> None:
         "Categories": DB_CATEGORIES,
     }
 
+    def _props(resp: dict) -> dict:
+        """Extract property map from databases.retrieve() response.
+        notion-client ≥3 returns data_sources[0].schema instead of properties."""
+        if "properties" in resp:
+            return resp["properties"]
+        ds = resp.get("data_sources", [])
+        if ds:
+            return ds[0].get("schema", {})
+        return {}
+
     print("Fetching Notion schemas…")
     schemas = {label: notion.databases.retrieve(database_id=db_id)
                for label, db_id in db_map.items()}
 
     errors: list[str] = []
     for label, required in REQUIRED_PROPS.items():
-        schema = schemas[label]
-        if "properties" not in schema:
-            print(f"  [DEBUG] {label} response keys: {list(schema.keys())}")
-            raise RuntimeError(f"[{label}] API response missing 'properties' key")
-        missing = required - set(schema["properties"].keys())
+        props = _props(schemas[label])
+        missing = required - set(props.keys())
         if missing:
             errors.append(f"  [{label}] missing: {sorted(missing)}")
     if errors:
         raise RuntimeError("Schema validation failed:\n" + "\n".join(errors))
 
-    income_props = schemas["Income"]["properties"]
+    income_props = _props(schemas["Income"])
     title_prop  = next((n for n, p in income_props.items() if p["type"] == "title"), None)
     amount_prop = next((n for n, p in income_props.items() if p["type"] == "number"), None)
     notes_prop  = next(
