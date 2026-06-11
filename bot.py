@@ -860,6 +860,114 @@ def cmd_spending(args: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# /d — on-demand digest (today's activity + month summary + balances)
+# ---------------------------------------------------------------------------
+
+
+def cmd_digest() -> str:
+    import calendar
+    from collections import defaultdict
+
+    now = datetime.now(CAIRO_TZ)
+    year, month = now.year, now.month
+    today_str = now.date().isoformat()
+    month_label = f"{year:04d}-{month:02d}"
+    last_day = calendar.monthrange(year, month)[1]
+    month_start = f"{year:04d}-{month:02d}-01"
+    month_end = f"{year:04d}-{month:02d}-{last_day:02d}"
+
+    # ── Today's expenses ────────────────────────────────────────────────────
+    today_pages = notion_query_all(DB_EXPENSES, filter={
+        "property": "Date", "date": {"equals": today_str}
+    })
+    today_total = 0.0
+    today_lines: list[str] = []
+    for page in today_pages:
+        props = page["properties"]
+        amt = props["Total Amount"].get("number") or 0.0
+        today_total += amt
+        name_parts = props["Expense"]["title"]
+        name = name_parts[0]["plain_text"].strip() if name_parts else "—"
+        rels = props["Categories"]["relation"]
+        cat_name = ""
+        if rels:
+            for c in CATEGORIES:
+                if c.page_id == rels[0]["id"]:
+                    cat_name = f" · {c.name}"
+                    break
+        today_lines.append(f"  {fmt_num(amt)}{cat_name} — {_h(name)}")
+
+    # ── This month's income ─────────────────────────────────────────────────
+    income_pages = notion_query_all(DB_INCOME, filter={"and": [
+        {"property": "Date", "date": {"on_or_after": month_start}},
+        {"property": "Date", "date": {"on_or_before": month_end}},
+    ]})
+    month_income = sum(
+        (p["properties"].get(INCOME_SCHEMA.amount_prop or "", {}).get("number") or 0.0)
+        for p in income_pages
+    )
+
+    # ── Month spending by category ──────────────────────────────────────────
+    exp_pages = notion_query_all(DB_EXPENSES, filter={"and": [
+        {"property": "Date", "date": {"on_or_after": month_start}},
+        {"property": "Date", "date": {"on_or_before": month_end}},
+    ]})
+    spent: dict[str, float] = {c.page_id: 0.0 for c in CATEGORIES}
+    month_total = 0.0
+    for page in exp_pages:
+        amt = page["properties"]["Total Amount"].get("number") or 0.0
+        month_total += amt
+        for rel in page["properties"]["Categories"]["relation"]:
+            if rel["id"] in spent:
+                spent[rel["id"]] += amt
+
+    # ── Balances ────────────────────────────────────────────────────────────
+    all_bal = compute_all_balances()
+
+    # ── Assemble message ────────────────────────────────────────────────────
+    lines: list[str] = [f"📋 <b>Digest — {today_str}</b>\n"]
+
+    # Today
+    if today_lines:
+        lines.append(f"💸 <b>Today</b> ({fmt_num(today_total)} EGP)")
+        lines.extend(today_lines)
+    else:
+        lines.append("💸 <b>Today</b>: no expenses logged")
+    lines.append("")
+
+    # Month spending
+    lines.append(f"📈 <b>{month_label} spending</b>: {fmt_num(month_total)} EGP")
+    cat_rows = [(c, spent[c.page_id]) for c in CATEGORIES if spent[c.page_id] > 0]
+    cat_rows.sort(key=lambda r: r[1], reverse=True)
+    for cat, amount in cat_rows[:5]:
+        if cat.monthly_budget > 0:
+            pct = amount / cat.monthly_budget * 100
+            mark = "🔴" if pct > 100 else ("⚠️" if pct >= 80 else "✅")
+            lines.append(f"  {mark} {_h(cat.name)}: {fmt_num(amount)} / {fmt_num(cat.monthly_budget)}")
+        else:
+            lines.append(f"  ▫️ {_h(cat.name)}: {fmt_num(amount)}")
+    if len(cat_rows) > 5:
+        lines.append(f"  … and {len(cat_rows) - 5} more")
+
+    if month_income > 0:
+        lines.append(f"💰 <b>Income this month</b>: {fmt_num(month_income)} EGP")
+    lines.append("")
+
+    # Balances
+    by_currency: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for acc in sorted(ACCOUNTS, key=lambda a: a.name):
+        bal = all_bal.get(acc.page_id, acc.initial_amount)
+        by_currency[acc.currency].append((acc.name, bal))
+    lines.append("🏦 <b>Balances</b>")
+    for currency in sorted(by_currency.keys()):
+        flag = CURRENCY_FLAG.get(currency, "💰")
+        for name, bal in by_currency[currency]:
+            lines.append(f"  {flag} {_h(name)}: {_h(fmt_amount(bal, currency))}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # /undo
 # ---------------------------------------------------------------------------
 
@@ -924,6 +1032,7 @@ def cmd_help() -> str:
         "<code>/s</code> — this month vs budget\n"
         "<code>/s 2026-05</code> — specific month\n\n"
         "<b>Other</b>\n"
+        "<code>/d</code> — today's activity + month summary + balances\n"
         "<code>/accounts</code> — full account list\n"
         "<code>/undo</code> — archive last bot entry\n"
         "<code>/help</code> — this message\n\n"
@@ -1024,6 +1133,9 @@ def handle_message(msg: dict, state: dict) -> str:
 
     if text.startswith("/s ") or text == "/s":
         return cmd_spending(text[2:].strip())
+
+    if text == "/d" or text == "/digest":
+        return cmd_digest()
 
     if text == "/undo":
         return cmd_undo(state)
@@ -1135,6 +1247,7 @@ BOT_COMMANDS = [
     {"command": "t",        "description": "🔄 Transfer     →  /t 2000 @nbe @cash"},
     {"command": "b",        "description": "📊 Balances     →  /b  or  /b @nbe"},
     {"command": "s",        "description": "📈 Spending     →  /s  or  /s 2026-05"},
+    {"command": "d",        "description": "📋 Digest       →  today + month + balances"},
     {"command": "accounts", "description": "🏦 All accounts with currency"},
     {"command": "undo",     "description": "↩️ Undo the last entry the bot created"},
     {"command": "help",     "description": "❓ All commands with examples"},
