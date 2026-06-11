@@ -182,6 +182,18 @@ def validate_and_load_schemas() -> None:
     schemas = {label: notion.databases.retrieve(database_id=db_id)
                for label, db_id in db_map.items()}
 
+    # Temporary debug: reveal notion-client v3 response structure
+    for label, resp in schemas.items():
+        top_keys = list(resp.keys())
+        print(f"[DEBUG] {label} top-level keys: {top_keys}")
+        ds = resp.get("data_sources", [])
+        if ds:
+            print(f"[DEBUG] {label} data_sources[0] keys: {list(ds[0].keys())}")
+            for k, v in ds[0].items():
+                print(f"[DEBUG]   {label}.data_sources[0][{k!r}] => type={type(v).__name__}, preview={str(v)[:120]}")
+        if "properties" in resp:
+            print(f"[DEBUG] {label} has direct 'properties' with keys: {list(resp['properties'].keys())[:5]}")
+
     errors: list[str] = []
     for label, required in REQUIRED_PROPS.items():
         props = _props(schemas[label])
