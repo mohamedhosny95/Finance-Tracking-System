@@ -169,7 +169,6 @@ def validate_and_load_schemas() -> None:
     }
 
     print("Fetching Notion schemas…")
-    print(f"[DEBUG] notion.databases methods: {[m for m in dir(notion.databases) if not m.startswith('_')]}")
     schemas: dict[str, dict] = {}
     access_errors: list[str] = []
     for label, db_id in db_map.items():
