@@ -174,7 +174,11 @@ def validate_and_load_schemas() -> None:
 
     errors: list[str] = []
     for label, required in REQUIRED_PROPS.items():
-        missing = required - set(schemas[label]["properties"].keys())
+        schema = schemas[label]
+        if "properties" not in schema:
+            print(f"  [DEBUG] {label} response keys: {list(schema.keys())}")
+            raise RuntimeError(f"[{label}] API response missing 'properties' key")
+        missing = required - set(schema["properties"].keys())
         if missing:
             errors.append(f"  [{label}] missing: {sorted(missing)}")
     if errors:
