@@ -168,30 +168,41 @@ def validate_and_load_schemas() -> None:
         "Categories": DB_CATEGORIES,
     }
 
+    # databases.retrieve() returns empty `properties` for linked-view databases —
+    # the integration can see the object but not the source schema.
+    # databases.query() bypasses this: result rows always carry full property info.
     print("Fetching Notion schemas…")
-    schemas = {label: notion.databases.retrieve(database_id=db_id)
-               for label, db_id in db_map.items()}
-
-    for label, resp in schemas.items():
-        obj_type = resp.get("object", "MISSING")
-        props_keys = list(resp.get("properties", {}).keys())
-        print(f"[DEBUG] {label}: object={obj_type!r}, properties keys={props_keys[:8]}")
+    schemas: dict[str, dict] = {}
+    access_errors: list[str] = []
+    for label, db_id in db_map.items():
+        try:
+            result = notion.databases.query(database_id=db_id, page_size=1)
+            pages = result.get("results", [])
+            schemas[label] = pages[0]["properties"] if pages else {}
+            if not pages:
+                print(f"  [{label}] empty database — skipping property check")
+        except Exception as exc:
+            access_errors.append(f"  [{label}] {exc}")
+    if access_errors:
+        raise RuntimeError("Cannot access databases:\n" + "\n".join(access_errors))
 
     errors: list[str] = []
     for label, required in REQUIRED_PROPS.items():
-        props = schemas[label].get("properties", {})
+        props = schemas.get(label, {})
+        if not props:
+            continue  # empty DB — trust the schema is correct
         missing = required - set(props.keys())
         if missing:
             errors.append(f"  [{label}] missing: {sorted(missing)}")
     if errors:
         raise RuntimeError("Schema validation failed:\n" + "\n".join(errors))
 
-    income_props = schemas["Income"].get("properties", {})
-    title_prop  = next((n for n, p in income_props.items() if p["type"] == "title"), None)
-    amount_prop = next((n for n, p in income_props.items() if p["type"] == "number"), None)
+    income_props = schemas.get("Income", {})
+    title_prop  = next((n for n, p in income_props.items() if p.get("type") == "title"), None)
+    amount_prop = next((n for n, p in income_props.items() if p.get("type") == "number"), None)
     notes_prop  = next(
         (n for n, p in income_props.items()
-         if p["type"] in ("rich_text", "text") and "note" in n.lower()), None
+         if p.get("type") in ("rich_text", "text") and "note" in n.lower()), None
     )
     if not title_prop or not amount_prop:
         raise RuntimeError(
