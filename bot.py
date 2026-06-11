@@ -52,11 +52,11 @@ notion = Client(auth=NOTION_KEY)
 # Notion Database IDs
 # ---------------------------------------------------------------------------
 
-DB_ACCOUNTS   = "23efa9ca-b092-81ed-8e88-000ba0b07ad4"
-DB_EXPENSES   = "23efa9ca-b092-813f-8e4b-000bc2057d91"
-DB_INCOME     = "23efa9ca-b092-8135-af20-000be6ea046b"
-DB_TRANSFER   = "23efa9ca-b092-811c-927f-000b84373de0"
-DB_CATEGORIES = "23efa9ca-b092-8196-a31f-000bc455781d"
+DB_ACCOUNTS   = "23efa9ca-b092-81aa-a943-d0a6d63888da"
+DB_EXPENSES   = "23efa9ca-b092-81ce-86dc-f2b9b77a82f3"
+DB_INCOME     = "23efa9ca-b092-8147-826e-e1a707be4f53"
+DB_TRANSFER   = "23efa9ca-b092-812d-a04d-d79c983ec06c"
+DB_CATEGORIES = "23efa9ca-b092-817f-b519-f8687de1e45a"
 
 REQUIRED_PROPS: dict[str, set[str]] = {
     "Accounts":   {"Name", "Initial Amount", "Currency"},
