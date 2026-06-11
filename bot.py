@@ -168,10 +168,8 @@ def validate_and_load_schemas() -> None:
         "Categories": DB_CATEGORIES,
     }
 
-    # databases.retrieve() returns empty `properties` for linked-view databases —
-    # the integration can see the object but not the source schema.
-    # databases.query() bypasses this: result rows always carry full property info.
     print("Fetching Notion schemas…")
+    print(f"[DEBUG] notion.databases methods: {[m for m in dir(notion.databases) if not m.startswith('_')]}")
     schemas: dict[str, dict] = {}
     access_errors: list[str] = []
     for label, db_id in db_map.items():
