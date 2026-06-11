@@ -43,6 +43,7 @@ TELEGRAM_TOKEN    = _env("TELEGRAM_BOT_TOKEN")
 NOTION_KEY        = _env("NOTION_API_KEY")
 ALLOWED_USER_ID   = _env_int("ALLOWED_TELEGRAM_USER_ID")
 BOT_STATE_PAGE_ID = _env("BOT_STATE_PAGE_ID")
+GEMINI_KEY: Optional[str] = os.environ.get("GEMINI_API_KEY", "").strip().strip("'\"").strip() or None
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -934,6 +935,59 @@ def cmd_help() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Free-text parsing via Gemini (Step 6)
+# ---------------------------------------------------------------------------
+
+
+def _gemini_parse(text: str) -> tuple[str, Optional[str]]:
+    """Return (cmd_type, args_string) where cmd_type is expense/income/transfer/unknown."""
+    if not GEMINI_KEY:
+        return "unknown", None
+
+    accounts_str = ", ".join(
+        f"@{a.name.lower().replace(' ', '')}" for a in ACCOUNTS
+    )
+    categories_str = ", ".join(c.name for c in CATEGORIES)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    prompt = f"""Parse this personal finance message and output ONLY a JSON object.
+
+Available accounts: {accounts_str}
+Available categories: {categories_str}
+Today: {today}
+
+Message: "{text}"
+
+Output exactly one of these JSON shapes:
+{{"type":"expense","args":"<amount> <category> <note> @<account>"}}
+{{"type":"income","args":"<amount> <note> @<account>"}}
+{{"type":"transfer","args":"<amount_out> @<from> <amount_in> @<to> [note]"}}
+{{"type":"unknown"}}
+
+Rules:
+- amount is a plain number, no currency symbols
+- account must be one from the available list (use the @alias form)
+- category must be one from the available list
+- for same-currency transfer: amount @from @to [note]
+- for cross-currency transfer: amount_out @from amount_in @to [note]
+- if the message is unclear, output {{"type":"unknown"}}
+- output ONLY the JSON, nothing else"""
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_KEY)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+        response = model.generate_content(prompt)
+        raw = response.text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        data = json.loads(raw)
+        return data.get("type", "unknown"), data.get("args")
+    except Exception:
+        return "unknown", None
+
+
+# ---------------------------------------------------------------------------
 # Message routing
 # ---------------------------------------------------------------------------
 
@@ -977,7 +1031,25 @@ def handle_message(msg: dict, state: dict) -> str:
     if text == "/start":
         return cmd_help()
 
-    # Fallback — free text handled in Step 6
+    # Free-text fallback via Gemini
+    if not text.startswith("/"):
+        cmd_type, args = _gemini_parse(text)
+        if cmd_type == "expense":
+            reply, page_info = cmd_expense(args or "")
+            if page_info:
+                state["last_page_id"], state["last_database"] = page_info
+            return reply
+        if cmd_type == "income":
+            reply, page_info = cmd_income(args or "")
+            if page_info:
+                state["last_page_id"], state["last_database"] = page_info
+            return reply
+        if cmd_type == "transfer":
+            reply, page_info = cmd_transfer(args or "")
+            if page_info:
+                state["last_page_id"], state["last_database"] = page_info
+            return reply
+
     return (
         "🤔 I didn't understand that.\n\n"
         "Try:\n"
