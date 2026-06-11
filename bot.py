@@ -53,9 +53,9 @@ notion = Client(auth=NOTION_KEY)
 # ---------------------------------------------------------------------------
 
 DB_ACCOUNTS   = "23efa9ca-b092-813a-94a0-c93d9ce4e2d9"
-DB_EXPENSES   = "23efa9ca-b092-815f-b24e-faaa9556f254"
+DB_EXPENSES   = "23efa9ca-b092-8179-b11f-d5bcb8c3c589"
 DB_INCOME     = "23efa9ca-b092-816d-951e-d8d5eaf2fc3e"
-DB_TRANSFER   = "23efa9ca-b092-8063-9aa6-df71d21d39f3"
+DB_TRANSFER   = "23efa9ca-b092-814e-9816-e451c38b5aac"
 DB_CATEGORIES = "23efa9ca-b092-81dd-ae1c-d6f19bf425e4"
 
 REQUIRED_PROPS: dict[str, set[str]] = {
