@@ -168,40 +168,25 @@ def validate_and_load_schemas() -> None:
         "Categories": DB_CATEGORIES,
     }
 
-    # notion-client v3 databases.retrieve() returns data_sources[id,name] only for
-    # inline databases — no properties/schema. Use query(page_size=1) instead,
-    # which always includes full property info in each result page.
     print("Fetching Notion schemas…")
-    schemas: dict[str, dict] = {}
-    access_errors: list[str] = []
-    for label, db_id in db_map.items():
-        try:
-            result = notion.databases.query(database_id=db_id, page_size=1)
-            pages = result.get("results", [])
-            schemas[label] = pages[0]["properties"] if pages else {}
-        except Exception as exc:
-            access_errors.append(f"  [{label}] {exc}")
-    if access_errors:
-        raise RuntimeError("Cannot access databases:\n" + "\n".join(access_errors))
+    schemas = {label: notion.databases.retrieve(database_id=db_id)
+               for label, db_id in db_map.items()}
 
     errors: list[str] = []
     for label, required in REQUIRED_PROPS.items():
-        props = schemas.get(label, {})
-        if not props:
-            print(f"  [{label}] empty — skipping property check")
-            continue
+        props = schemas[label].get("properties", {})
         missing = required - set(props.keys())
         if missing:
             errors.append(f"  [{label}] missing: {sorted(missing)}")
     if errors:
         raise RuntimeError("Schema validation failed:\n" + "\n".join(errors))
 
-    income_props = schemas.get("Income", {})
-    title_prop  = next((n for n, p in income_props.items() if p.get("type") == "title"), None)
-    amount_prop = next((n for n, p in income_props.items() if p.get("type") == "number"), None)
+    income_props = schemas["Income"].get("properties", {})
+    title_prop  = next((n for n, p in income_props.items() if p["type"] == "title"), None)
+    amount_prop = next((n for n, p in income_props.items() if p["type"] == "number"), None)
     notes_prop  = next(
         (n for n, p in income_props.items()
-         if p.get("type") in ("rich_text", "text") and "note" in n.lower()), None
+         if p["type"] in ("rich_text", "text") and "note" in n.lower()), None
     )
     if not title_prop or not amount_prop:
         raise RuntimeError(
